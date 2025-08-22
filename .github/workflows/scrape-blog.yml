@@ -3,7 +3,7 @@ name: Scrape Tennis Blog HTML
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 3 * * *" # daily at 03:17 UTC
 
 permissions:
   contents: write
@@ -46,7 +46,6 @@ jobs:
           const HOST = start.host;
           const OUT_DIR = path.join("snapshots", HOST);
 
-          // Basic filters for non-HTML assets
           const ASSET_EXT = [
             ".pdf",".jpg",".jpeg",".png",".gif",".webp",".svg",
             ".mp3",".mp4",".zip",".css",".js",".woff",".woff2",".ttf",".eot",".ico"
@@ -73,17 +72,20 @@ jobs:
             return ASSET_EXT.some(ext => p.endsWith(ext));
           }
 
+          // ---- NEW: skip rules ----
+          function shouldSkip(u) {
+            const path = new URL(u, BASE_ORIGIN).pathname;
+            return path.startsWith("/podcast") || path.startsWith("/events");
+          }
+          // --------------------------
+
           function urlToFilePath(u) {
             const { pathname, search } = new URL(u);
             let p = pathname;
-
-            // Preserve folders, write index.html where appropriate
             if (p === "" || p === "/") p = "/index.html";
             else if (path.extname(p) === "") p = path.posix.join(p, "index.html");
 
             let rel = p.startsWith("/") ? p.slice(1) : p;
-
-            // Append a safe suffix for query strings
             if (search) {
               const safe = search.replace(/[^\w]+/g, "_").replace(/^_+|_+$/g, "");
               rel = rel.replace(/\.html$/, `_${safe}.html`);
@@ -112,27 +114,21 @@ jobs:
             while (queue.length) {
               const current = stripHash(queue.shift());
               if (seen.has(current)) continue;
-              if (!sameOrigin(current) || looksLikeAsset(current)) continue;
+              if (!sameOrigin(current) || looksLikeAsset(current) || shouldSkip(current)) continue;
               seen.add(current);
 
               try {
-                // Navigate and wait for a real render
                 await page.goto(current, { waitUntil: "networkidle", timeout: 60000 });
 
-                // Heuristic waits to avoid empty root issues
-                // 1) wait for body to have some visible content
                 await page.waitForFunction(() => {
                   const b = document.body;
                   if (!b) return false;
                   const text = b.innerText || "";
-                  // require at least a bit of content
                   return text.trim().length > 40 || b.querySelector("*") !== null;
                 }, { timeout: 20000 });
 
-                // 2) tiny idle pause for late JS
                 await sleep(500);
 
-                // Optional: scroll to bottom to trigger lazy content
                 await page.evaluate(async () => {
                   const scroll = () => new Promise(r => {
                     let y = 0;
@@ -146,24 +142,20 @@ jobs:
                 });
                 await sleep(300);
 
-                // Capture fully rendered HTML
                 const html = await page.content();
-
                 const filePath = urlToFilePath(current);
                 await saveFile(filePath, html);
 
-                // Discover more links on the page
                 const hrefs = await page.$$eval("a[href]", as => as.map(a => a.getAttribute("href")).filter(Boolean));
                 for (const href of hrefs) {
                   try {
                     const abs = stripHash(new URL(href, current).href);
-                    if (sameOrigin(abs) && !looksLikeAsset(abs) && !seen.has(abs)) {
+                    if (sameOrigin(abs) && !looksLikeAsset(abs) && !seen.has(abs) && !shouldSkip(abs)) {
                       discovered.add(abs);
                     }
-                  } catch { /* ignore malformed */ }
+                  } catch {}
                 }
 
-                // enqueue deterministic order
                 const newlyFound = Array.from(discovered).sort();
                 discovered.clear();
                 queue.push(...newlyFound);
@@ -171,13 +163,11 @@ jobs:
                 console.error("Failed:", current, err.message);
               }
 
-              // Be polite
               await sleep(200);
             }
 
             await browser.close();
 
-            // Save manifest
             const manifestPath = path.join(OUT_DIR, "manifest.txt");
             await ensureDirFor(manifestPath);
             await saveFile(manifestPath, Array.from(seen).sort().join("\n"));
