@@ -1,10 +1,9 @@
-# .github/workflows/scrape-blog.yml
 name: Scrape Tennis Blog HTML
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * *"  # daily at 03:17 UTC
+    - cron: "17 3 * * *"
 
 permissions:
   contents: write
@@ -21,130 +20,183 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          python-version: "3.11"
+          node-version: "20"
 
-      - name: Install deps
+      - name: Install Playwright
         run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          npm init -y
+          npm i playwright@1
+          npx playwright install --with-deps chromium
 
-      - name: Write scraper
+      - name: Write crawler script
         run: |
           mkdir -p scripts
-          cat > scripts/scrape_blog.py << 'PY'
-          import os, time, re
-          from urllib.parse import urljoin, urlparse, urlunparse
-          import requests
-          from bs4 import BeautifulSoup
-          from pathlib import Path
+          cat > scripts/scrape_blog.mjs << 'JS'
+          import fs from "node:fs/promises";
+          import path from "node:path";
+          import { URL } from "node:url";
+          import { chromium } from "playwright";
 
-          START_URL = os.environ.get("START_URL", "https://blog.theloveoftennis.co.uk/")
-          BASE_NETLOC = urlparse(START_URL).netloc
-          OUTPUT_DIR = Path("snapshots")
-          OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+          const START_URL = process.env.START_URL || "https://blog.theloveoftennis.co.uk/";
+          const start = new URL(START_URL);
+          const BASE_ORIGIN = start.origin;
+          const HOST = start.host;
+          const OUT_DIR = path.join("snapshots", HOST);
 
-          session = requests.Session()
-          session.headers.update({
-              "User-Agent": "GitHubActionsSiteArchiver/1.0 (+https://github.com/)"
-          })
+          // Basic filters for non-HTML assets
+          const ASSET_EXT = [
+            ".pdf",".jpg",".jpeg",".png",".gif",".webp",".svg",
+            ".mp3",".mp4",".zip",".css",".js",".woff",".woff2",".ttf",".eot",".ico"
+          ];
 
-          def normalise_url(u: str) -> str:
-              p = urlparse(u)
-              p = p._replace(fragment="", query=p.query)
-              return urlunparse(p)
+          const seen = new Set();
+          const queue = [start.href];
 
-          def is_internal(u: str) -> bool:
-              try:
-                  return urlparse(u).netloc == BASE_NETLOC
-              except Exception:
-                  return False
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-          def slugify(text: str) -> str:
-              text = re.sub(r'[^a-zA-Z0-9_-]', '_', text)
-              return text.strip("_") or "index"
+          function sameOrigin(u) {
+            try { return new URL(u, BASE_ORIGIN).origin === BASE_ORIGIN; }
+            catch { return false; }
+          }
 
-          def to_filepath(u: str) -> Path:
-              p = urlparse(u)
-              path = p.path
-              if path in ["", "/"]:
-                  filename = "index.html"
-              else:
-                  parts = [slugify(part) for part in path.strip("/").split("/")]
-                  filename = "_".join(parts) + ".html"
-              # add query string if present
-              if p.query:
-                  filename = filename.replace(".html", "_" + slugify(p.query) + ".html")
-              save_path = OUTPUT_DIR / BASE_NETLOC / filename
-              save_path.parent.mkdir(parents=True, exist_ok=True)
-              return save_path
+          function stripHash(u) {
+            const url = new URL(u, BASE_ORIGIN);
+            url.hash = "";
+            return url.href;
+          }
 
-          def fetch(url: str) -> tuple[int, str]:
-              try:
-                  r = session.get(url, timeout=20)
-                  return r.status_code, r.text
-              except requests.RequestException:
-                  return 0, ""
+          function looksLikeAsset(u) {
+            const p = new URL(u, BASE_ORIGIN).pathname.toLowerCase();
+            return ASSET_EXT.some(ext => p.endsWith(ext));
+          }
 
-          def extract_links(base_url: str, html: str) -> set[str]:
-              out = set()
-              soup = BeautifulSoup(html, "html.parser")
-              for a in soup.find_all("a", href=True):
-                  href = a["href"].strip()
-                  absolute = urljoin(base_url, href)
-                  absolute = normalise_url(absolute)
-                  if is_internal(absolute):
-                      if absolute.startswith(("mailto:", "tel:")):
-                          continue
-                      if any(absolute.lower().endswith(ext) for ext in [".pdf",".jpg",".jpeg",".png",".gif",".webp",".svg",".mp3",".mp4",".zip"]):
-                          continue
-                      out.add(absolute)
-              return out
+          function urlToFilePath(u) {
+            const { pathname, search } = new URL(u);
+            let p = pathname;
 
-          def should_skip(url: str) -> bool:
-              lower = url.lower()
-              if "/wp-admin" in lower or "/wp-login" in lower:
-                  return True
-              return False
+            // Preserve folders, write index.html where appropriate
+            if (p === "" || p === "/") p = "/index.html";
+            else if (path.extname(p) === "") p = path.posix.join(p, "index.html");
 
-          visited = set()
-          queue = [normalise_url(START_URL)]
+            let rel = p.startsWith("/") ? p.slice(1) : p;
 
-          while queue:
-              url = queue.pop(0)
-              if url in visited or should_skip(url):
-                  continue
-              visited.add(url)
+            // Append a safe suffix for query strings
+            if (search) {
+              const safe = search.replace(/[^\w]+/g, "_").replace(/^_+|_+$/g, "");
+              rel = rel.replace(/\.html$/, `_${safe}.html`);
+            }
+            return path.join(OUT_DIR, rel);
+          }
 
-              status, html = fetch(url)
-              if status != 200 or not html:
-                  continue
+          async function ensureDirFor(filePath) {
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+          }
 
-              fp = to_filepath(url)
-              fp.write_text(html, encoding="utf-8")
+          async function saveFile(filePath, contents) {
+            await ensureDirFor(filePath);
+            await fs.writeFile(filePath, contents, "utf8");
+          }
 
-              links = extract_links(url, html)
-              for link in sorted(links):
-                  if link not in visited:
-                      queue.append(link)
+          async function crawl() {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              userAgent: "GitHubActionsPlaywrightArchiver/1.0"
+            });
+            const page = await context.newPage();
 
-              time.sleep(0.5)
+            const discovered = new Set();
 
-          manifest = OUTPUT_DIR / BASE_NETLOC / "manifest.txt"
-          manifest.write_text("\n".join(sorted(visited)), encoding="utf-8")
-          print(f"Captured {len(visited)} pages to {OUTPUT_DIR/BASE_NETLOC}")
-          PY
+            while (queue.length) {
+              const current = stripHash(queue.shift());
+              if (seen.has(current)) continue;
+              if (!sameOrigin(current) || looksLikeAsset(current)) continue;
+              seen.add(current);
 
-      - name: Run scraper
+              try {
+                // Navigate and wait for a real render
+                await page.goto(current, { waitUntil: "networkidle", timeout: 60000 });
+
+                // Heuristic waits to avoid empty root issues
+                // 1) wait for body to have some visible content
+                await page.waitForFunction(() => {
+                  const b = document.body;
+                  if (!b) return false;
+                  const text = b.innerText || "";
+                  // require at least a bit of content
+                  return text.trim().length > 40 || b.querySelector("*") !== null;
+                }, { timeout: 20000 });
+
+                // 2) tiny idle pause for late JS
+                await sleep(500);
+
+                // Optional: scroll to bottom to trigger lazy content
+                await page.evaluate(async () => {
+                  const scroll = () => new Promise(r => {
+                    let y = 0;
+                    const i = setInterval(() => {
+                      const max = document.documentElement.scrollHeight || document.body.scrollHeight || 0;
+                      window.scrollTo(0, y += 800);
+                      if (y >= max) { clearInterval(i); r(); }
+                    }, 50);
+                  });
+                  await scroll();
+                });
+                await sleep(300);
+
+                // Capture fully rendered HTML
+                const html = await page.content();
+
+                const filePath = urlToFilePath(current);
+                await saveFile(filePath, html);
+
+                // Discover more links on the page
+                const hrefs = await page.$$eval("a[href]", as => as.map(a => a.getAttribute("href")).filter(Boolean));
+                for (const href of hrefs) {
+                  try {
+                    const abs = stripHash(new URL(href, current).href);
+                    if (sameOrigin(abs) && !looksLikeAsset(abs) && !seen.has(abs)) {
+                      discovered.add(abs);
+                    }
+                  } catch { /* ignore malformed */ }
+                }
+
+                // enqueue deterministic order
+                const newlyFound = Array.from(discovered).sort();
+                discovered.clear();
+                queue.push(...newlyFound);
+              } catch (err) {
+                console.error("Failed:", current, err.message);
+              }
+
+              // Be polite
+              await sleep(200);
+            }
+
+            await browser.close();
+
+            // Save manifest
+            const manifestPath = path.join(OUT_DIR, "manifest.txt");
+            await ensureDirFor(manifestPath);
+            await saveFile(manifestPath, Array.from(seen).sort().join("\n"));
+            console.log(`Captured ${seen.size} pages into ${OUT_DIR}`);
+          }
+
+          crawl().catch(e => {
+            console.error(e);
+            process.exit(1);
+          });
+          JS
+
+      - name: Run crawler
         env:
           START_URL: https://blog.theloveoftennis.co.uk/
-        run: |
-          python scripts/scrape_blog.py
+        run: node scripts/scrape_blog.mjs
 
-      - name: Auto-commit changes
+      - name: Commit updates
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update scraped blog HTML"
+          commit_message: "chore: update rendered blog HTML"
           file_pattern: snapshots/**
