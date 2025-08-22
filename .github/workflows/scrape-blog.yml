@@ -1,0 +1,153 @@
+# .github/workflows/scrape-blog.yml
+name: Scrape Tennis Blog HTML
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"  # daily at 03:17 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scrape-tennis-blog
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Write scraper
+        run: |
+          mkdir -p scripts
+          cat > scripts/scrape_blog.py << 'PY'
+          import os, time, hashlib, re
+          from urllib.parse import urljoin, urlparse, urlunparse
+          import requests
+          from bs4 import BeautifulSoup
+          from pathlib import Path
+
+          START_URL = os.environ.get("START_URL", "https://blog.theloveoftennis.co.uk/")
+          BASE_NETLOC = urlparse(START_URL).netloc
+          OUTPUT_DIR = Path("snapshots")
+          OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "GitHubActionsSiteArchiver/1.0 (+https://github.com/)"
+          })
+
+          def normalise_url(u: str) -> str:
+              # remove fragments, keep scheme and netloc
+              p = urlparse(u)
+              p = p._replace(fragment="", query=p.query)
+              # normalise trailing slash for root or directories
+              return urlunparse(p)
+
+          def is_internal(u: str) -> bool:
+              try:
+                  return urlparse(u).netloc == BASE_NETLOC
+              except Exception:
+                  return False
+
+          def to_filepath(u: str) -> Path:
+              p = urlparse(u)
+              path = p.path
+              if path.endswith("/"):
+                  path = path + "index.html"
+              elif not os.path.splitext(path)[1]:
+                  # no file extension, treat as directory index
+                  path = path.rstrip("/") + "/index.html"
+              # prefix with host for safety
+              save_path = OUTPUT_DIR / BASE_NETLOC / path.lstrip("/")
+              save_path.parent.mkdir(parents=True, exist_ok=True)
+              return save_path
+
+          def fetch(url: str) -> tuple[int, str]:
+              try:
+                  r = session.get(url, timeout=20)
+                  return r.status_code, r.text
+              except requests.RequestException:
+                  return 0, ""
+
+          def extract_links(base_url: str, html: str) -> set[str]:
+              out = set()
+              soup = BeautifulSoup(html, "html.parser")
+              for a in soup.find_all("a", href=True):
+                  href = a["href"].strip()
+                  absolute = urljoin(base_url, href)
+                  absolute = normalise_url(absolute)
+                  if is_internal(absolute):
+                      # skip mailto, tel, fragments-only, and obvious files
+                      if absolute.startswith("mailto:") or absolute.startswith("tel:"):
+                          continue
+                      if any(absolute.lower().endswith(ext) for ext in [".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".mp3", ".mp4", ".zip"]):
+                          continue
+                      out.add(absolute)
+              return out
+
+          def should_skip(url: str) -> bool:
+              # Optional filters to limit scope further
+              # Example: skip admin or feed endpoints
+              lower = url.lower()
+              if "/wp-admin" in lower or "/wp-login" in lower:
+                  return True
+              return False
+
+          visited = set()
+          queue = [normalise_url(START_URL)]
+
+          while queue:
+              url = queue.pop(0)
+              if url in visited or should_skip(url):
+                  continue
+              visited.add(url)
+
+              status, html = fetch(url)
+              if status != 200 or not html:
+                  continue
+
+              # Save HTML
+              fp = to_filepath(url)
+              fp.write_text(html, encoding="utf-8")
+
+              # Discover more pages
+              links = extract_links(url, html)
+              for link in sorted(links):
+                  if link not in visited:
+                      queue.append(link)
+
+              # Be polite
+              time.sleep(0.5)
+
+          # Also save a simple manifest of what was captured
+          manifest = OUTPUT_DIR / BASE_NETLOC / "manifest.txt"
+          manifest.write_text("\n".join(sorted(visited)), encoding="utf-8")
+          print(f"Captured {len(visited)} pages to {OUTPUT_DIR/BASE_NETLOC}")
+          PY
+
+      - name: Run scraper
+        env:
+          START_URL: https://blog.theloveoftennis.co.uk/
+        run: |
+          python scripts/scrape_blog.py
+
+      - name: Auto-commit changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update scraped blog HTML"
+          file_pattern: snapshots/**
