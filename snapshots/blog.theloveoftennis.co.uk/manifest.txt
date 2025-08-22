@@ -1,6 +1,5 @@
 https://blog.theloveoftennis.co.uk/
 https://blog.theloveoftennis.co.uk/contact
-https://blog.theloveoftennis.co.uk/events
 https://blog.theloveoftennis.co.uk/news/andy-murray-memorable-matches
 https://blog.theloveoftennis.co.uk/news/daily-tennis-roundup-2025-06-22
 https://blog.theloveoftennis.co.uk/news/eastbourne-tennis-open-2025-results-highlights
@@ -25,4 +24,3 @@ https://blog.theloveoftennis.co.uk/news/wimbledon-day-9
 https://blog.theloveoftennis.co.uk/news/wimbledon-mens-final-2025
 https://blog.theloveoftennis.co.uk/news/wimbledon-preview-2025
 https://blog.theloveoftennis.co.uk/news/wimbledon-womens-final-2025
-https://blog.theloveoftennis.co.uk/podcast
